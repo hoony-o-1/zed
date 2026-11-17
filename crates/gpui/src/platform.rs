@@ -1,4 +1,5 @@
-// Modified by Ojwriter, 2026-11-17: finish_composition patch (PlatformWindow::finish_composition, CompositionFinish, CompositionCallbacks). Licensed under Apache-2.0 as the rest of this file.
+// Modified by Ojwriter, 2026-11-17: finish_composition patch (PlatformWindow::finish_composition, CompositionFinish, CompositionCallbacks);
+// diagnostic patch (debug log when an IME callback cannot reach the app; no behavior change). Licensed under Apache-2.0 as the rest of this file.
 mod app_menu;
 mod keyboard;
 mod keystroke;
@@ -2124,6 +2125,9 @@ impl PlatformInputHandler {
     pub fn marked_text_range(&mut self) -> Option<Range<usize>> {
         self.cx
             .update(|window, cx| self.handler.marked_text_range(window, cx))
+            .inspect_err(|error| {
+                log::debug!("PlatformInputHandler marked_text_range query dropped: {error}")
+            })
             .ok()
             .flatten()
     }
@@ -2152,6 +2156,9 @@ impl PlatformInputHandler {
                 self.handler
                     .replace_text_in_range(replacement_range, text, window, cx);
             })
+            .inspect_err(|error| {
+                log::debug!("PlatformInputHandler IME replace_text_in_range dropped: {error}")
+            })
             .ok();
     }
 
@@ -2171,6 +2178,11 @@ impl PlatformInputHandler {
                     cx,
                 )
             })
+            .inspect_err(|error| {
+                log::debug!(
+                    "PlatformInputHandler IME replace_and_mark_text_in_range dropped: {error}"
+                )
+            })
             .ok();
     }
 
@@ -2178,6 +2190,9 @@ impl PlatformInputHandler {
     pub fn unmark_text(&mut self) {
         self.cx
             .update(|window, cx| self.handler.unmark_text(window, cx))
+            .inspect_err(|error| {
+                log::debug!("PlatformInputHandler IME unmark_text dropped: {error}")
+            })
             .ok();
     }
 

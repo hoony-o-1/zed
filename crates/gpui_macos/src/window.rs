@@ -1,4 +1,5 @@
-// Modified by Ojwriter, 2026-11-17: finish_composition patch (MacWindow::finish_composition and callback probe). Licensed under Apache-2.0 as the rest of this file.
+// Modified by Ojwriter, 2026-11-17: finish_composition patch (MacWindow::finish_composition and callback probe);
+// diagnostic patch (log-only key/IME callback trace in handle_key_event; no behavior change). Licensed under Apache-2.0 as the rest of this file.
 use crate::{
     BoolExt, MacDisplay, MetalFrames, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
@@ -687,6 +688,8 @@ struct MacWindowState {
     do_command_handled: Option<bool>,
     // Ojwriter patch: callback counters, set only while `finish_composition` probes.
     composition_probe: Option<CompositionCallbacks>,
+    // Ojwriter diagnostic patch: callback names seen during one `handleEvent:`, trace logging only.
+    key_trace: Option<Vec<&'static str>>,
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
@@ -1155,6 +1158,7 @@ impl MacWindow {
                 keystroke_for_do_command: None,
                 do_command_handled: None,
                 composition_probe: None,
+                key_trace: None,
                 external_files_dragged: false,
                 first_mouse: false,
                 app_owns_titlebar_drag,
@@ -2840,10 +2844,12 @@ extern "C" fn handle_key_event(
                     && !key_down_event.keystroke.modifiers.function
                     && !key_down_event.keystroke.modifiers.platform)
             {
+                let tracing = log::log_enabled!(log::Level::Trace);
                 {
                     let mut lock = window_state.as_ref().lock();
                     lock.keystroke_for_do_command = Some(key_down_event.keystroke.clone());
                     lock.do_command_handled.take();
+                    lock.key_trace = tracing.then(Vec::new);
                     drop(lock);
                 }
 
@@ -2856,7 +2862,20 @@ extern "C" fn handle_key_event(
                     }
                 };
                 window_state.as_ref().lock().keystroke_for_do_command.take();
-                if let Some(handled) = window_state.as_ref().lock().do_command_handled.take() {
+                let do_command_handled = window_state.as_ref().lock().do_command_handled.take();
+                if tracing {
+                    let order = window_state.as_ref().lock().key_trace.take();
+                    trace_key_event(
+                        &key_down_event,
+                        key_equivalent,
+                        is_composing,
+                        is_ime_printable_key,
+                        handled,
+                        do_command_handled,
+                        order,
+                    );
+                }
+                if let Some(handled) = do_command_handled {
                     return handled.to_objc();
                 } else if handled == Bool::YES {
                     return Bool::YES;
@@ -2892,14 +2911,28 @@ extern "C" fn handle_key_event(
                 return Bool::NO;
             }
 
-            unsafe {
+            let tracing = log::log_enabled!(log::Level::Trace);
+            if tracing {
+                window_state.as_ref().lock().key_trace = Some(Vec::new());
+            }
+            let handled: Bool = unsafe {
                 let input_context: *mut AnyObject = msg_send![this, inputContext];
                 if input_context.is_null() {
                     Bool::NO
                 } else {
                     msg_send![input_context, handleEvent: native_event]
                 }
+            };
+            if tracing {
+                let order = window_state.as_ref().lock().key_trace.take();
+                log::trace!(
+                    "gpui_macos key (late handleEvent): {} -> handled={:?} callbacks={:?}",
+                    describe_key(&key_down_event),
+                    handled,
+                    order
+                );
             }
+            handled
         }
 
         PlatformInput::KeyUp(_) => {
@@ -3611,6 +3644,7 @@ extern "C" fn insert_text(
         let text = text.to_str();
         let replacement_range = replacement_range.to_range();
         note_composition_callback(this, |c| c.insert_text += 1);
+        trace_key_callback(this, "insertText");
         with_input_handler(this, |input_handler| {
             input_handler.replace_text_in_range(replacement_range, text)
         });
@@ -3635,6 +3669,7 @@ extern "C" fn set_marked_text(
         let replacement_range = replacement_range.to_range();
         let text = text.to_str();
         note_composition_callback(this, |c| c.set_marked_text += 1);
+        trace_key_callback(this, "setMarkedText");
         with_input_handler(this, |input_handler| {
             input_handler.replace_and_mark_text_in_range(replacement_range, text, selected_range)
         });
@@ -3642,6 +3677,7 @@ extern "C" fn set_marked_text(
 }
 extern "C" fn unmark_text(this: &AnyObject, _: Sel) {
     note_composition_callback(this, |c| c.unmark_text += 1);
+    trace_key_callback(this, "unmarkText");
     with_input_handler(this, |input_handler| input_handler.unmark_text());
 }
 
@@ -3683,6 +3719,14 @@ extern "C" fn do_command_by_selector(this: &AnyObject, _: Sel, _: Sel) {
     let keystroke = lock.keystroke_for_do_command.take();
     let mut event_callback = lock.event_callback.take();
     drop(lock);
+    trace_key_callback(this, "doCommand");
+    if keystroke.is_none() || event_callback.is_none() {
+        log::debug!(
+            "gpui_macos doCommandBySelector: no app dispatch (keystroke={}, event_callback={})",
+            keystroke.is_some(),
+            event_callback.is_some()
+        );
+    }
 
     if let Some((keystroke, callback)) = keystroke.zip(event_callback.as_mut()) {
         let handled = (callback)(PlatformInput::KeyDown(KeyDownEvent {
@@ -3960,6 +4004,57 @@ fn drag_event_position(
     convert_mouse_position(drag_location, window_state.lock().content_size().height)
 }
 
+/// Ojwriter diagnostic patch: describes a key without its typed text. Named keys
+/// (enter, left, ...) are shown by name; single-character keys are masked.
+fn describe_key(event: &KeyDownEvent) -> String {
+    let key = &event.keystroke.key;
+    let key = if key.chars().count() > 1 {
+        key.as_str()
+    } else {
+        "<char>"
+    };
+    format!(
+        "key={key} mods={:?} key_char={} held={}",
+        event.keystroke.modifiers,
+        event.keystroke.key_char.is_some(),
+        event.is_held
+    )
+}
+
+/// Ojwriter diagnostic patch: one trace line per key that went through `handleEvent:` first.
+fn trace_key_event(
+    event: &KeyDownEvent,
+    key_equivalent: bool,
+    is_composing: bool,
+    is_ime_printable_key: bool,
+    handled: Bool,
+    do_command_handled: Option<bool>,
+    order: Option<Vec<&'static str>>,
+) {
+    log::trace!(
+        "gpui_macos key: {} equivalent={key_equivalent} composing={is_composing} \
+         ime_printable={is_ime_printable_key} handleEvent={:?} doCommand={} \
+         do_command_handled={do_command_handled:?} callbacks={:?}",
+        describe_key(event),
+        handled,
+        order
+            .as_ref()
+            .is_some_and(|order| order.contains(&"doCommand")),
+        order
+    );
+}
+
+/// Ojwriter diagnostic patch: records a callback name for the key being traced.
+fn trace_key_callback(window: &AnyObject, name: &'static str) {
+    if !log::log_enabled!(log::Level::Trace) {
+        return;
+    }
+    let window_state = unsafe { get_window_state(window) };
+    if let Some(trace) = window_state.lock().key_trace.as_mut() {
+        trace.push(name);
+    }
+}
+
 /// Ojwriter patch: counts a text-input callback while `finish_composition` probes.
 fn note_composition_callback(window: &AnyObject, f: impl FnOnce(&mut CompositionCallbacks)) {
     let window_state = unsafe { get_window_state(window) };
@@ -3980,6 +4075,7 @@ where
         window_state.lock().input_handler = Some(input_handler);
         Some(result)
     } else {
+        log::debug!("gpui_macos with_input_handler: no input handler (not installed or taken)");
         None
     }
 }
