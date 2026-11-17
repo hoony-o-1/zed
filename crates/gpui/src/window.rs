@@ -1,3 +1,5 @@
+// Modified by Ojwriter, 2026-11-17: finish_composition patch (Window::finish_composition). Licensed under Apache-2.0 as the rest of this file.
+use crate::CompositionFinish;
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -3319,6 +3321,29 @@ impl Window {
     /// Show the platform character palette.
     pub fn show_character_palette(&self) {
         self.platform_window.show_character_palette();
+    }
+
+    /// Modified by Ojwriter, 2026-11-17: ask the platform to finish the active
+    /// composition of the input handler registered for `focus_handle`.
+    ///
+    /// The platform step runs on a later main-thread turn, outside any `App`
+    /// borrow, so IME callbacks it triggers are not lost. The task resolves with
+    /// the outcome; dropping the task discards the result but not the request.
+    /// `cx` is only used to reach the foreground executor.
+    pub fn finish_composition(
+        &self,
+        focus_handle: &FocusHandle,
+        cx: &App,
+    ) -> Task<CompositionFinish> {
+        let (tx, rx) = oneshot::channel();
+        self.platform_window.finish_composition(
+            focus_handle.id,
+            Box::new(move |outcome| {
+                let _ = tx.send(outcome);
+            }),
+        );
+        cx.foreground_executor()
+            .spawn(async move { rx.await.unwrap_or(CompositionFinish::Unsupported) })
     }
 
     /// The scale factor of the display associated with the window. For example, it could

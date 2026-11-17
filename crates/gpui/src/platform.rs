@@ -1,3 +1,4 @@
+// Modified by Ojwriter, 2026-11-17: finish_composition patch (PlatformWindow::finish_composition, CompositionFinish, CompositionCallbacks). Licensed under Apache-2.0 as the rest of this file.
 mod app_menu;
 mod keyboard;
 mod keystroke;
@@ -1350,6 +1351,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     #[cfg(target_os = "macos")]
     fn set_traffic_light_position(&self, _position: Point<Pixels>) {}
     fn show_character_palette(&self) {}
+
+    /// Modified by Ojwriter, 2026-11-17: finish the active composition of the
+    /// input handler registered for `focus`, outside any `App` borrow.
+    ///
+    /// Implementations must run the platform step on a later main-thread turn
+    /// (never inside the caller's stack) and call `done` exactly once. The
+    /// default reports [`CompositionFinish::Unsupported`].
+    fn finish_composition(&self, _focus: crate::FocusId, done: Box<dyn FnOnce(CompositionFinish)>) {
+        done(CompositionFinish::Unsupported)
+    }
     fn titlebar_double_click(&self, _is_resizable: bool, _is_minimizable: bool) {}
     fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
     fn on_merge_all_windows(&self, _callback: Box<dyn FnMut()>) {}
@@ -2031,6 +2042,35 @@ impl From<TileId> for etagere::AllocId {
     fn from(id: TileId) -> Self {
         Self::deserialize(id.0)
     }
+}
+
+/// Modified by Ojwriter, 2026-11-17: number of text-input callbacks the platform
+/// delivered to the input handler while a composition finish was probed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompositionCallbacks {
+    /// `insertText:replacementRange:` callbacks.
+    pub insert_text: u32,
+    /// `setMarkedText:selectedRange:replacementRange:` callbacks.
+    pub set_marked_text: u32,
+    /// `unmarkText` callbacks.
+    pub unmark_text: u32,
+}
+
+/// Modified by Ojwriter, 2026-11-17: outcome of [`PlatformWindow::finish_composition`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompositionFinish {
+    /// The handler had no marked text when the request ran.
+    NothingMarked,
+    /// The input method committed the marked text (callbacks counted during the probe).
+    CommittedByInputMethod(CompositionCallbacks),
+    /// The input method did not commit; the client unmarked the text itself.
+    CommittedByClient(CompositionCallbacks),
+    /// Marked text remained after both attempts.
+    StillMarked(CompositionCallbacks),
+    /// The installed handler no longer belongs to the requested focus (or the window closed).
+    TargetChanged,
+    /// The platform does not implement this request.
+    Unsupported,
 }
 
 #[expect(missing_docs)]

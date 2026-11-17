@@ -1,3 +1,4 @@
+// Modified by Ojwriter, 2026-11-17: finish_composition patch (MacWindow::finish_composition and callback probe). Licensed under Apache-2.0 as the rest of this file.
 use crate::{
     BoolExt, MacDisplay, MetalFrames, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
@@ -16,6 +17,7 @@ use gpui::{
     SharedString, Size, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControlArea, WindowKind, WindowParams, WindowVisibility, point, px, size,
 };
+use gpui::{CompositionCallbacks, CompositionFinish, FocusId};
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 
@@ -683,6 +685,8 @@ struct MacWindowState {
     previous_modifiers_changed_event: Option<PlatformInput>,
     keystroke_for_do_command: Option<Keystroke>,
     do_command_handled: Option<bool>,
+    // Ojwriter patch: callback counters, set only while `finish_composition` probes.
+    composition_probe: Option<CompositionCallbacks>,
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
@@ -1150,6 +1154,7 @@ impl MacWindow {
                 previous_modifiers_changed_event: None,
                 keystroke_for_do_command: None,
                 do_command_handled: None,
+                composition_probe: None,
                 external_files_dragged: false,
                 first_mouse: false,
                 app_owns_titlebar_drag,
@@ -1963,6 +1968,63 @@ impl PlatformWindow for MacWindow {
                     let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
                     let _: () = msg_send![app, orderFrontCharacterPalette: window];
                 }
+            })
+            .detach();
+    }
+
+    fn finish_composition(&self, focus: FocusId, done: Box<dyn FnOnce(CompositionFinish)>) {
+        let (state, foreground_executor, closed, native_view) = {
+            let this = self.0.lock();
+            // Retain the view so it outlives the deferred turn; `closed` is checked below.
+            let native_view = unsafe { Retained::retain(this.native_view.as_ptr()) };
+            (
+                self.0.clone(),
+                this.foreground_executor.clone(),
+                this.closed.clone(),
+                native_view,
+            )
+        };
+        foreground_executor
+            .spawn(async move {
+                let Some(view) = native_view else {
+                    return done(CompositionFinish::TargetChanged);
+                };
+                if closed.load(Ordering::Acquire) {
+                    return done(CompositionFinish::TargetChanged);
+                }
+                let this: &AnyObject = &view;
+                if with_input_handler(this, |h| h.focus_id() == Some(focus)) != Some(true) {
+                    return done(CompositionFinish::TargetChanged);
+                }
+                let is_marked = || {
+                    with_input_handler(this, |h| h.marked_text_range())
+                        .flatten()
+                        .is_some()
+                };
+                if !is_marked() {
+                    return done(CompositionFinish::NothingMarked);
+                }
+                state.lock().composition_probe = Some(CompositionCallbacks::default());
+                // discard first: if the input method commits in response, the marked
+                // text is gone afterwards; unmarking first would double-insert.
+                unsafe {
+                    let input_context: *mut AnyObject = msg_send![this, inputContext];
+                    if !input_context.is_null() {
+                        let _: () = msg_send![input_context, discardMarkedText];
+                    }
+                }
+                let mut by_client = false;
+                if is_marked() {
+                    with_input_handler(this, |h| h.unmark_text());
+                    by_client = true;
+                }
+                let still_marked = is_marked();
+                let callbacks = state.lock().composition_probe.take().unwrap_or_default();
+                done(match (still_marked, by_client) {
+                    (true, _) => CompositionFinish::StillMarked(callbacks),
+                    (false, false) => CompositionFinish::CommittedByInputMethod(callbacks),
+                    (false, true) => CompositionFinish::CommittedByClient(callbacks),
+                })
             })
             .detach();
     }
@@ -3548,6 +3610,7 @@ extern "C" fn insert_text(
 
         let text = text.to_str();
         let replacement_range = replacement_range.to_range();
+        note_composition_callback(this, |c| c.insert_text += 1);
         with_input_handler(this, |input_handler| {
             input_handler.replace_text_in_range(replacement_range, text)
         });
@@ -3571,12 +3634,14 @@ extern "C" fn set_marked_text(
         let selected_range = selected_range.to_range();
         let replacement_range = replacement_range.to_range();
         let text = text.to_str();
+        note_composition_callback(this, |c| c.set_marked_text += 1);
         with_input_handler(this, |input_handler| {
             input_handler.replace_and_mark_text_in_range(replacement_range, text, selected_range)
         });
     }
 }
 extern "C" fn unmark_text(this: &AnyObject, _: Sel) {
+    note_composition_callback(this, |c| c.unmark_text += 1);
     with_input_handler(this, |input_handler| input_handler.unmark_text());
 }
 
@@ -3893,6 +3958,14 @@ fn drag_event_position(
 ) -> Point<Pixels> {
     let drag_location: NSPoint = unsafe { msg_send![dragging_info, draggingLocation] };
     convert_mouse_position(drag_location, window_state.lock().content_size().height)
+}
+
+/// Ojwriter patch: counts a text-input callback while `finish_composition` probes.
+fn note_composition_callback(window: &AnyObject, f: impl FnOnce(&mut CompositionCallbacks)) {
+    let window_state = unsafe { get_window_state(window) };
+    if let Some(probe) = window_state.lock().composition_probe.as_mut() {
+        f(probe);
+    }
 }
 
 fn with_input_handler<F, R>(window: &AnyObject, f: F) -> Option<R>
