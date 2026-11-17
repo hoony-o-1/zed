@@ -1,3 +1,4 @@
+// Modified by Ojwriter, 2026-11-17: should_terminate patch (App::on_should_terminate, App::reply_to_terminate). Licensed under Apache-2.0 as the rest of this file.
 use scheduler::Instant;
 use std::{
     any::{TypeId, type_name},
@@ -1342,6 +1343,34 @@ impl App {
     /// Gracefully quit the application via the platform's standard routine.
     pub fn quit(&self) {
         self.platform.quit();
+    }
+
+    /// Modified by Ojwriter, 2026-11-17: registers the handler that answers the
+    /// system's termination request (Cmd-Q, Dock Quit, logout). Return
+    /// [`crate::TerminateReply::Later`] to defer, then call [`App::reply_to_terminate`].
+    /// Without a handler termination proceeds immediately. If the `App` is already
+    /// borrowed when the request arrives, the reply is `Now` (the previous behavior).
+    pub fn on_should_terminate(
+        &self,
+        mut handler: impl FnMut(&mut App) -> crate::TerminateReply + 'static,
+    ) {
+        let this = self.this.clone();
+        self.platform.on_should_terminate(Box::new(move || {
+            let Some(app) = this.upgrade() else {
+                return crate::TerminateReply::Now;
+            };
+            match app.try_borrow_mut() {
+                Ok(mut cx) => handler(&mut cx),
+                Err(_) => crate::TerminateReply::Now,
+            }
+        }));
+    }
+
+    /// Modified by Ojwriter, 2026-11-17: completes a deferred termination:
+    /// `true` terminates, `false` cancels. Call it only after a handler returned
+    /// [`crate::TerminateReply::Later`].
+    pub fn reply_to_terminate(&self, should_terminate: bool) {
+        self.platform.reply_to_terminate(should_terminate);
     }
 
     /// Switches the platform between headless and windowed modes.

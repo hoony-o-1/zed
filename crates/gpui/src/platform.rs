@@ -463,6 +463,15 @@ pub trait Platform: 'static {
     fn open_with_system(&self, path: &Path);
 
     fn on_quit(&self, callback: Box<dyn FnMut() -> bool>);
+    /// Modified by Ojwriter, 2026-11-17: registers the callback that answers the
+    /// system's "should the app terminate?" question (macOS
+    /// `applicationShouldTerminate:`). Platforms without such a question ignore it,
+    /// and with no callback registered termination proceeds immediately.
+    fn on_should_terminate(&self, _callback: Box<dyn FnMut() -> TerminateReply>) {}
+    /// Modified by Ojwriter, 2026-11-17: completes a [`TerminateReply::Later`]
+    /// answer. `true` lets termination proceed, `false` cancels it. The platform
+    /// delivers the reply on a later main-thread turn, outside any `App` borrow.
+    fn reply_to_terminate(&self, _should_terminate: bool) {}
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
     /// Registers the callback invoked when the system is about to sleep.
     fn on_system_sleep(&self, callback: Box<dyn FnMut()>);
@@ -2043,6 +2052,18 @@ impl From<TileId> for etagere::AllocId {
     fn from(id: TileId) -> Self {
         Self::deserialize(id.0)
     }
+}
+
+/// Modified by Ojwriter, 2026-11-17: answer to the system's termination request
+/// (macOS `NSTerminateReply`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminateReply {
+    /// Terminate now (also the behavior when no callback is registered).
+    Now,
+    /// Refuse to terminate.
+    Cancel,
+    /// Defer; the app must later call `App::reply_to_terminate`.
+    Later,
 }
 
 /// Modified by Ojwriter, 2026-11-17: number of text-input callbacks the platform

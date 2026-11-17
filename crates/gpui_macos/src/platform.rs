@@ -1,3 +1,4 @@
+// Modified by Ojwriter, 2026-11-17: should_terminate patch (applicationShouldTerminate: delegate method). Licensed under Apache-2.0 as the rest of this file.
 use crate::{
     AppleActivity, AppleDispatcher, BoolExt, MacDisplay, MacKeyboardLayout, MacKeyboardMapper,
     MacWindow, events::key_to_native, main_thread_marker, ns_string, pasteboard::Pasteboard,
@@ -14,8 +15,8 @@ use gpui::{
     CursorStyle, ForegroundExecutor, GraphicalEnvironment, KeyContext, Keymap, Menu, MenuItem,
     OsMenu, OwnedMenu, PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout,
     PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, PowerMode, Result, SystemMenuType,
-    Task, ThermalState, WindowAppearance, WindowKind, WindowParams, WindowingRequest,
-    popup::PopupNotSupportedError,
+    Task, TerminateReply, ThermalState, WindowAppearance, WindowKind, WindowParams,
+    WindowingRequest, popup::PopupNotSupportedError,
 };
 use gpui_apple::{
     keychain,
@@ -86,6 +87,10 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(applicationShouldHandleReopen:hasVisibleWindows:),
                 should_handle_reopen as extern "C-unwind" fn(_, Sel, *mut AnyObject, Bool) -> Bool,
+            );
+            decl.add_method(
+                sel!(applicationShouldTerminate:),
+                should_terminate as extern "C-unwind" fn(_, Sel, *mut AnyObject) -> usize,
             );
             decl.add_method(
                 sel!(applicationWillTerminate:),
@@ -182,6 +187,7 @@ pub(crate) struct MacPlatformState {
     on_system_wake: Option<Box<dyn FnMut()>>,
     system_power_observers_registered: bool,
     quit: Option<Box<dyn FnMut() -> bool>>,
+    should_terminate: Option<Box<dyn FnMut() -> TerminateReply>>,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     will_open_menu: Option<Box<dyn FnMut()>>,
@@ -245,6 +251,7 @@ impl MacPlatform {
             find_pasteboard: Pasteboard::find(),
             reopen: None,
             quit: None,
+            should_terminate: None,
             menu_command: None,
             validate_menu_command: None,
             will_open_menu: None,
@@ -1039,6 +1046,28 @@ impl Platform for MacPlatform {
         self.0.lock().quit = Some(callback);
     }
 
+    fn on_should_terminate(&self, callback: Box<dyn FnMut() -> TerminateReply>) {
+        self.0.lock().should_terminate = Some(callback);
+    }
+
+    fn reply_to_terminate(&self, should_terminate: bool) {
+        // `replyToApplicationShouldTerminate:` may run `applicationWillTerminate:`
+        // synchronously, which needs the App unborrowed, so defer it like `quit`.
+        let arg = Box::into_raw(Box::new(should_terminate)) as *mut c_void;
+        unsafe {
+            DispatchQueue::main().exec_async_f(arg, reply);
+        }
+
+        extern "C" fn reply(arg: *mut c_void) {
+            let should_terminate = unsafe { *Box::from_raw(arg as *mut bool) };
+            unsafe {
+                let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+                let _: () =
+                    msg_send![app, replyToApplicationShouldTerminate: Bool::new(should_terminate)];
+            }
+        }
+    }
+
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().reopen = Some(callback);
     }
@@ -1388,6 +1417,23 @@ extern "C-unwind" fn should_handle_reopen(
         }
     }
     Bool::YES
+}
+
+extern "C-unwind" fn should_terminate(this: &AnyObject, _: Sel, _: *mut AnyObject) -> usize {
+    // NSTerminateCancel = 0, NSTerminateNow = 1, NSTerminateLater = 2.
+    let platform = unsafe { get_mac_platform(this) };
+    let mut lock = platform.0.lock();
+    let Some(mut callback) = lock.should_terminate.take() else {
+        return 1;
+    };
+    drop(lock);
+    let reply = callback();
+    platform.0.lock().should_terminate.get_or_insert(callback);
+    match reply {
+        TerminateReply::Cancel => 0,
+        TerminateReply::Now => 1,
+        TerminateReply::Later => 2,
+    }
 }
 
 extern "C-unwind" fn will_terminate(this: &AnyObject, _: Sel, _: *mut AnyObject) {
