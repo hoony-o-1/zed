@@ -1142,6 +1142,18 @@ impl App {
             }
         }));
 
+        // Modified by Ojwriter, 2026-11-19: follow the system's reduce-motion setting.
+        // Read it once at startup, then again whenever the platform reports a change.
+        app.borrow_mut().reduce_motion = platform.system_reduce_motion();
+        platform.on_reduce_motion_change(Box::new({
+            let app = Rc::downgrade(&app);
+            move |reduce_motion| {
+                if let Some(app) = app.upgrade() {
+                    app.borrow_mut().set_reduce_motion(reduce_motion);
+                }
+            }
+        }));
+
         platform.on_system_sleep(Box::new({
             let app = Rc::downgrade(&app);
             move || {

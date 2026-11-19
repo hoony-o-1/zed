@@ -160,6 +160,11 @@ unsafe fn build_classes() {
                 sel!(onSystemWake:),
                 on_system_wake as extern "C-unwind" fn(_, Sel, *mut AnyObject),
             );
+            decl.add_method(
+                sel!(onAccessibilityDisplayOptionsChange:),
+                on_accessibility_display_options_change
+                    as extern "C-unwind" fn(_, Sel, *mut AnyObject),
+            );
 
             decl.register()
         }
@@ -186,6 +191,8 @@ pub(crate) struct MacPlatformState {
     on_system_sleep: Option<Box<dyn FnMut()>>,
     on_system_wake: Option<Box<dyn FnMut()>>,
     system_power_observers_registered: bool,
+    on_reduce_motion_change: Option<Box<dyn FnMut(bool)>>,
+    reduce_motion_observer_registered: bool,
     quit: Option<Box<dyn FnMut() -> bool>>,
     should_terminate: Option<Box<dyn FnMut() -> TerminateReply>>,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
@@ -264,6 +271,8 @@ impl MacPlatform {
             power_mode_observer: None,
             on_displays_changed: None,
             on_system_sleep: None,
+            on_reduce_motion_change: None,
+            reduce_motion_observer_registered: false,
             on_system_wake: None,
             system_power_observers_registered: false,
             menus: None,
@@ -1093,6 +1102,14 @@ impl Platform for MacPlatform {
         self.0.lock().thermal_observer = Some(observer);
     }
 
+    fn system_reduce_motion(&self) -> bool {
+        read_system_reduce_motion()
+    }
+
+    fn on_reduce_motion_change(&self, callback: Box<dyn FnMut(bool)>) {
+        self.0.lock().on_reduce_motion_change = Some(callback);
+    }
+
     fn on_system_sleep(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().on_system_sleep = Some(callback);
         self.ensure_system_power_observers();
@@ -1371,6 +1388,10 @@ extern "C-unwind" fn did_finish_launching(this: &AnyObject, _: Sel, _: *mut AnyO
                 register_system_power_observers(this);
                 state.system_power_observers_registered = true;
             }
+            if state.on_reduce_motion_change.is_some() && !state.reduce_motion_observer_registered {
+                register_reduce_motion_observer(this);
+                state.reduce_motion_observer_registered = true;
+            }
             state.finish_launching.take()
         };
         if let Some(callback) = callback {
@@ -1396,6 +1417,37 @@ fn register_system_power_observers(observer: &AnyObject) {
             observer,
             objc2::sel!(onSystemWake:),
             Some(NSWorkspaceDidWakeNotification),
+            None,
+        );
+    }
+}
+
+/// Modified by Ojwriter, 2026-11-19: the system "Reduce motion" accessibility setting.
+fn read_system_reduce_motion() -> bool {
+    // The `NSAccessibility` feature of `objc2-app-kit` is not enabled, so send the
+    // message directly instead of enabling a new feature in the workspace manifest.
+    let workspace = NSWorkspace::sharedWorkspace();
+    // SAFETY: `accessibilityDisplayShouldReduceMotion` is a BOOL property of NSWorkspace.
+    let reduce_motion: Bool =
+        unsafe { msg_send![&*workspace, accessibilityDisplayShouldReduceMotion] };
+    reduce_motion.as_bool()
+}
+
+/// `observer` must be the app delegate, whose class declares
+/// `onAccessibilityDisplayOptionsChange:` (see `build_classes`). The notification
+/// is posted on the shared workspace's notification center.
+fn register_reduce_motion_observer(observer: &AnyObject) {
+    let center = NSWorkspace::sharedWorkspace().notificationCenter();
+    // The name is the value of `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification`
+    // (same string-name approach as the notifications in `did_finish_launching`).
+    let name = NSString::from_str("NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification");
+    // SAFETY: the selector is declared on the delegate class with the
+    // notification-handler signature this observer is invoked with.
+    unsafe {
+        center.addObserver_selector_name_object(
+            observer,
+            objc2::sel!(onAccessibilityDisplayOptionsChange:),
+            Some(&name),
             None,
         );
     }
@@ -1506,6 +1558,37 @@ extern "C-unwind" fn on_system_sleep(this: &AnyObject, _: Sel, _: *mut AnyObject
             drop(lock);
             callback();
             platform.0.lock().on_system_sleep.get_or_insert(callback);
+        }
+    }
+}
+
+// Modified by Ojwriter, 2026-11-19. Deferred to the main queue like the screen
+// parameter notification, so the callback never runs inside an `App` borrow. The
+// value is read when the block runs, so a burst of notifications ends on the latest.
+extern "C-unwind" fn on_accessibility_display_options_change(
+    this: &AnyObject,
+    _: Sel,
+    _: *mut AnyObject,
+) {
+    // SAFETY: this is the registered app delegate carrying MAC_PLATFORM_IVAR.
+    let platform = unsafe { get_mac_platform(this) };
+    let platform_ptr = platform as *const MacPlatform as *mut c_void;
+    // SAFETY: platform lives for the process lifetime while callbacks are registered.
+    unsafe {
+        DispatchQueue::main().exec_async_f(platform_ptr, on_accessibility_display_options_change);
+    }
+
+    extern "C" fn on_accessibility_display_options_change(context: *mut c_void) {
+        // SAFETY: context is the MacPlatform pointer queued above.
+        let platform = unsafe { &*(context as *const MacPlatform) };
+        let callback = platform.0.lock().on_reduce_motion_change.take();
+        if let Some(mut callback) = callback {
+            callback(read_system_reduce_motion());
+            platform
+                .0
+                .lock()
+                .on_reduce_motion_change
+                .get_or_insert(callback);
         }
     }
 }

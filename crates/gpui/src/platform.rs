@@ -477,6 +477,18 @@ pub trait Platform: 'static {
     fn on_system_sleep(&self, callback: Box<dyn FnMut()>);
     /// Registers the callback invoked when the system resumes from sleep.
     fn on_system_wake(&self, callback: Box<dyn FnMut()>);
+    /// Modified by Ojwriter, 2026-11-19: the system's "reduce motion" accessibility
+    /// setting as it is right now. Platforms that have no such setting report `false`.
+    /// Call it on the main thread.
+    fn system_reduce_motion(&self) -> bool {
+        false
+    }
+    /// Modified by Ojwriter, 2026-11-19: registers the callback invoked with the
+    /// current [`Platform::system_reduce_motion`] value after the system's
+    /// accessibility display options change. The callback runs on a later main-thread
+    /// turn, outside any `App` borrow, and may be called when the value did not change.
+    /// Platforms without the setting ignore it.
+    fn on_reduce_motion_change(&self, _callback: Box<dyn FnMut(bool)>) {}
 
     // Mobile platform methods. On mobile the OS owns the application
     // lifecycle: apps are backgrounded, foregrounded, and killed at the
